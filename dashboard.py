@@ -753,7 +753,7 @@ try:
 
     styled_matrix = (
         df_matrix.style
-        .applymap(apply_barchart_green)
+        .map(apply_barchart_green)
         .format("${:,.2f}")
     )
 
@@ -824,7 +824,7 @@ try:
 
     styled_return_table = (
         result["table"].style
-        .applymap(
+        .map(
             apply_barchart_green,
             subset=[
                 "Total Profit",
