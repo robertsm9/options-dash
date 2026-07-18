@@ -621,7 +621,7 @@ try:
     st.markdown("---")
 
     st.markdown(
-        " Live Risk & Scenario Matrix Engine"
+        "### Live Risk & Scenario Matrix Engine"
     )
 
     st.write(
@@ -909,7 +909,7 @@ try:
     st.markdown("---")
 
     st.markdown(
-        " Time Expiration Risk Explained"
+        "### Time Expiration Risk Explained"
     )
 
     st.write(
