@@ -6,3 +6,5 @@ scipy
 requests
 openpyxl
 pytest
+yfinance
+matplotlib
