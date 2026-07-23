@@ -1,17 +1,22 @@
 """
 Bloom Energy Spread Calculator — home page of the multipage app.
 
+Runs on the Public.com brokerage API (see common.py for the CONFIRM
+notes on base URL / expirations response shape — verify those against
+your actual account before relying on this in production). UI/format
+intentionally matches the previous Alpaca-based version exactly.
+
 The Options Calculator lives as a separate page under pages/, and runs
 fully independently (Streamlit only executes the code for whichever
 page is currently selected — no shared API calls firing in the
 background between them).
 
 Setup:
-    pip install streamlit alpaca-py scipy numpy requests openpyxl
+    pip install streamlit numpy pandas scipy requests openpyxl
 
     .streamlit/secrets.toml:
-        ALPACA_API_KEY = "..."
-        ALPACA_SECRET_KEY = "..."
+        PUBLIC_SECRET_TOKEN = "..."
+        PUBLIC_ACCOUNT_ID = "..."
 
 Run:
     streamlit run spread-mech.py
@@ -26,14 +31,14 @@ import streamlit as st
 from scipy.optimize import brentq
 from scipy.stats import norm
 
-from alpaca.data.requests import OptionChainRequest, StockLatestTradeRequest
-
 from common import (
+    fetch_option_chain_for_expiration,
+    fetch_option_expirations,
     fetch_risk_free_rate,
+    fetch_stock_quote,
     fetch_with_retry,
     get_clients,
     get_mid_price,
-    parse_osi_symbol,
 )
 
 TICKER_SYMBOL = "BE"
@@ -103,85 +108,123 @@ def implied_vol_call(market_price, S, K, T_days, r, q=0.0):
         return None
 
 
+def interpolate_iv_at_dte(reliable_dtes, reliable_ivs, target_dte):
+    """
+    Vol-curve fallback: linear interpolation of IV across DTE, using
+    only expirations whose own quotes passed the reliability check.
+    Used when a specific leg's own quote is flagged unreliable (wide
+    spread / stale) — instead of trusting a bad quote, borrow a
+    plausible IV from the surrounding, trustworthy term structure and
+    recompute the theoretical price from that.
+
+    Requires at least 2 reliable points to interpolate between. Returns
+    None if there aren't enough reliable points to interpolate from.
+    """
+    pairs = sorted(
+        (d, iv) for d, iv in zip(reliable_dtes, reliable_ivs)
+        if d is not None and iv is not None
+    )
+    if len(pairs) < 2:
+        return None
+    dtes = [p[0] for p in pairs]
+    ivs = [p[1] for p in pairs]
+    return float(np.interp(target_dte, dtes, ivs))
+
+
 @st.cache_data(ttl=300)
-def fetch_current_price(_stock_client, ticker_symbol):
-    request = StockLatestTradeRequest(symbol_or_symbols=ticker_symbol)
-    trade = _stock_client.get_stock_latest_trade(request)
-    price = trade[ticker_symbol].price
+def fetch_current_price(access_token, account_id, ticker_symbol):
+    quote = fetch_stock_quote(access_token, account_id, ticker_symbol)
+    price = quote.get("last")
     if price is None:
-        raise ValueError(f"Alpaca did not return a current price for {ticker_symbol}.")
+        raise ValueError(f"Public API did not return a last price for {ticker_symbol}.")
     return round(float(price), 2)
 
 
 @st.cache_data(ttl=300)
-def fetch_all_calls(_option_client, ticker_symbol, current_price, risk_free_rate):
+def fetch_all_calls(access_token, account_id, ticker_symbol, current_price, risk_free_rate):
     """
-    Pull the full option chain (calls only). Per contract: Alpaca's own
-    IV/delta first, solved locally from that contract's own market price
-    only if Alpaca doesn't supply it. No borrowing from other strikes.
+    Pull the full option chain (calls only), across every available
+    expiration. Per contract: Public's own IV/delta first, solved
+    locally from that contract's own market price only if Public
+    doesn't supply it. No borrowing from other strikes here — the
+    cross-expiration IV interpolation fallback is applied later, only
+    for legs flagged unreliable, in fetch_spread_term_structure.
 
-    Each row now also carries `mid_reliable` (bool) and `mid_reason`
-    (str or None) from get_mid_price, so downstream code and the UI can
-    tell a tight, trustworthy quote apart from a wide-spread or stale
-    one instead of treating every positive price as equally trustworthy.
+    Each row also carries `mid_reliable` (bool) and `mid_reason` (str
+    or None) from get_mid_price, using Public's per-quote timestamps
+    for a direct, market-hours-aware staleness check.
     """
-    request = OptionChainRequest(underlying_symbol=ticker_symbol)
-    chain = _option_client.get_option_chain(request)
-
     today = datetime.now().date()
+    expirations = fetch_option_expirations(access_token, account_id, ticker_symbol)
+
     rows = []
-
-    for osi_symbol, snapshot in chain.items():
-        parsed = parse_osi_symbol(osi_symbol)
-        if not parsed:
-            continue
-        underlying, expiration_date, option_type, strike = parsed
-        if option_type != "call":
-            continue
-
-        last_price = snapshot.latest_trade.price if snapshot.latest_trade else None
-        bid = snapshot.latest_quote.bid_price if snapshot.latest_quote else None
-        ask = snapshot.latest_quote.ask_price if snapshot.latest_quote else None
-        mid, mid_reliable, mid_reason = get_mid_price(bid, ask, last_price)
-
-        raw_iv = getattr(snapshot, "implied_volatility", None)
-        greeks = getattr(snapshot, "greeks", None)
-        raw_delta = getattr(greeks, "delta", None) if greeks is not None else None
-
+    for expiration_str in expirations:
+        expiration_date = datetime.strptime(expiration_str[:10], "%Y-%m-%d").date()
         dte = (expiration_date - today).days
+        if dte < 0:
+            continue
 
-        if raw_iv is not None:
-            iv_pct = float(raw_iv) * 100
-            iv_source = "alpaca"
-        else:
-            solved_iv = None
-            if mid > 0 and dte > 0 and risk_free_rate is not None:
-                solved_iv = implied_vol_call(mid, current_price, strike, dte, risk_free_rate / 100.0)
-            iv_pct = solved_iv * 100 if solved_iv is not None else None
-            iv_source = "solved" if solved_iv is not None else None
+        chain = fetch_option_chain_for_expiration(access_token, account_id, ticker_symbol, expiration_str)
 
-        if raw_delta is not None:
-            delta_val = float(raw_delta)
-            delta_source = "alpaca"
-        else:
-            delta_val = None
-            delta_source = None
-            if iv_pct is not None and dte > 0 and risk_free_rate is not None:
-                delta_val = bs_call_delta(current_price, strike, dte, risk_free_rate / 100.0, iv_pct / 100.0)
-                delta_source = "calculated"
+        for call in chain.get("calls", []):
+            if call.get("outcome") != "SUCCESS":
+                continue
 
-        rows.append({
-            "osi_symbol": osi_symbol,
-            "expiration": expiration_date,
-            "strike": strike,
-            "mid": mid,
-            "mid_reliable": mid_reliable,
-            "mid_reason": mid_reason,
-            "implied_volatility": iv_pct,
-            "iv_source": iv_source,
-            "delta": delta_val,
-            "delta_source": delta_source,
-        })
+            instrument = call.get("instrument", {})
+            symbol = instrument.get("symbol")
+
+            option_details = call.get("optionDetails", {})
+            strike = option_details.get("strikePrice")
+            if strike is None:
+                continue
+            strike = float(strike)
+
+            last_price = float(call["last"]) if call.get("last") else None
+            bid = float(call["bid"]) if call.get("bid") else None
+            ask = float(call["ask"]) if call.get("ask") else None
+            bid_ts = call.get("bidTimestamp")
+            ask_ts = call.get("askTimestamp")
+
+            mid, mid_reliable, mid_reason = get_mid_price(
+                bid, ask, last_price, bid_timestamp=bid_ts, ask_timestamp=ask_ts,
+            )
+
+            greeks = option_details.get("greeks", {})
+            raw_iv = greeks.get("impliedVolatility")
+            raw_delta = greeks.get("delta")
+
+            if raw_iv is not None:
+                iv_pct = float(raw_iv) * 100
+                iv_source = "public"
+            else:
+                solved_iv = None
+                if mid > 0 and dte > 0 and risk_free_rate is not None:
+                    solved_iv = implied_vol_call(mid, current_price, strike, dte, risk_free_rate / 100.0)
+                iv_pct = solved_iv * 100 if solved_iv is not None else None
+                iv_source = "solved" if solved_iv is not None else None
+
+            if raw_delta is not None:
+                delta_val = float(raw_delta)
+                delta_source = "public"
+            else:
+                delta_val = None
+                delta_source = None
+                if iv_pct is not None and dte > 0 and risk_free_rate is not None:
+                    delta_val = bs_call_delta(current_price, strike, dte, risk_free_rate / 100.0, iv_pct / 100.0)
+                    delta_source = "calculated"
+
+            rows.append({
+                "symbol": symbol,
+                "expiration": expiration_date,
+                "strike": strike,
+                "mid": mid,
+                "mid_reliable": mid_reliable,
+                "mid_reason": mid_reason,
+                "implied_volatility": iv_pct,
+                "iv_source": iv_source,
+                "delta": delta_val,
+                "delta_source": delta_source,
+            })
 
     if not rows:
         raise ValueError(f"No call option data returned for {ticker_symbol}.")
@@ -191,13 +234,25 @@ def fetch_all_calls(_option_client, ticker_symbol, current_price, risk_free_rate
 
 @st.cache_data(ttl=300)
 def fetch_spread_term_structure(
-    _option_client, ticker_symbol, long_strike, short_strike, covered_call_strike,
+    access_token, account_id, ticker_symbol, long_strike, short_strike, covered_call_strike,
     current_price, risk_free_rate,
 ):
-    all_calls = fetch_all_calls(_option_client, ticker_symbol, current_price, risk_free_rate)
+    all_calls = fetch_all_calls(access_token, account_id, ticker_symbol, current_price, risk_free_rate)
 
     today = datetime.now().date()
     rows = []
+
+    # Build the reliable-only (DTE, IV) reference list ONCE, from every
+    # expiration's short-strike leg that passed the reliability check —
+    # this is the term structure the interpolation fallback borrows
+    # from when a specific leg's own quote is untrustworthy.
+    reliable_dtes, reliable_ivs = [], []
+    for expiration_date, group in all_calls.groupby("expiration"):
+        dte = (expiration_date - today).days
+        short_row, _ = get_option_row(group, short_strike)
+        if short_row is not None and bool(short_row["mid_reliable"]) and short_row["implied_volatility"] is not None:
+            reliable_dtes.append(dte)
+            reliable_ivs.append(short_row["implied_volatility"])
 
     for expiration_date, group in all_calls.groupby("expiration"):
         dte = (expiration_date - today).days
@@ -213,6 +268,35 @@ def fetch_spread_term_structure(
 
         long_premium = float(long_row["mid"])
         short_premium = float(short_row["mid"])
+
+        # Collect any unreliable-quote reasons for this expiration's legs,
+        # so the UI can warn on exactly the rows most likely to produce
+        # the "collapsed spread value -> inflated return" failure mode.
+        # Dollar signs are escaped (\$) since these strings get rendered
+        # through st.warning/st.info's Markdown engine, which otherwise
+        # treats a "$...$" pair as LaTeX math delimiters and garbles text.
+        unreliable_legs = []
+
+        if not bool(long_row["mid_reliable"]):
+            unreliable_legs.append(f"Lo \\${long_actual_strike:.2f}: {long_row['mid_reason']}")
+            interpolated_iv = interpolate_iv_at_dte(reliable_dtes, reliable_ivs, dte)
+            if interpolated_iv is not None:
+                theo_price, _, _ = bs_call_price(
+                    current_price, long_actual_strike, dte, risk_free_rate / 100.0, interpolated_iv / 100.0,
+                )
+                long_premium = round(theo_price, 2)
+                unreliable_legs[-1] += f" -> used interpolated IV ({interpolated_iv:.1f}%) instead"
+
+        if not bool(short_row["mid_reliable"]):
+            unreliable_legs.append(f"Hi \\${short_actual_strike:.2f}: {short_row['mid_reason']}")
+            interpolated_iv = interpolate_iv_at_dte(reliable_dtes, reliable_ivs, dte)
+            if interpolated_iv is not None:
+                theo_price, _, _ = bs_call_price(
+                    current_price, short_actual_strike, dte, risk_free_rate / 100.0, interpolated_iv / 100.0,
+                )
+                short_premium = round(theo_price, 2)
+                unreliable_legs[-1] += f" -> used interpolated IV ({interpolated_iv:.1f}%) instead"
+
         if long_premium <= 0 or short_premium < 0:
             continue
 
@@ -227,24 +311,22 @@ def fetch_spread_term_structure(
         short_delta_source = short_row["delta_source"]
         long_delta_source = long_row["delta_source"]
 
-        # Collect any unreliable-quote reasons for this expiration's legs,
-        # so the UI can warn on exactly the rows most likely to produce
-        # the "collapsed spread value -> inflated return" failure mode.
-        unreliable_legs = []
-        if not bool(long_row["mid_reliable"]):
-            unreliable_legs.append(f"Lo ${long_actual_strike:.2f}: {long_row['mid_reason']}")
-        if not bool(short_row["mid_reliable"]):
-            unreliable_legs.append(f"Hi ${short_actual_strike:.2f}: {short_row['mid_reason']}")
-
         if covered_call_row is not None:
             covered_call_iv = covered_call_row["implied_volatility"]
             covered_call_premium = float(covered_call_row["mid"])
             covered_call_delta = covered_call_row["delta"]
             covered_call_delta_source = covered_call_row["delta_source"]
             if not bool(covered_call_row["mid_reliable"]):
-                unreliable_legs.append(
-                    f"Covered call ${covered_call_actual_strike:.2f}: {covered_call_row['mid_reason']}"
-                )
+                interpolated_iv = interpolate_iv_at_dte(reliable_dtes, reliable_ivs, dte)
+                note = f"Covered call \\${covered_call_actual_strike:.2f}: {covered_call_row['mid_reason']}"
+                if interpolated_iv is not None:
+                    theo_price, _, _ = bs_call_price(
+                        current_price, covered_call_actual_strike, dte,
+                        risk_free_rate / 100.0, interpolated_iv / 100.0,
+                    )
+                    covered_call_premium = round(theo_price, 2)
+                    note += f" -> used interpolated IV ({interpolated_iv:.1f}%) instead"
+                unreliable_legs.append(note)
         else:
             covered_call_iv = short_iv
             covered_call_premium = short_premium
@@ -299,20 +381,8 @@ def build_metrics_df(term_df, current_price, long_strike, short_strike, covered_
     IMPORTANT: "Call sold" (the premium that funds the spreads) uses
     the COVERED CALL'S premium, not the spread's Hi strike premium.
 
-    Delta section — sourced from Alpaca's server-side greeks when
+    Delta section — sourced from Public's server-side greeks when
     available, else calculated locally via Black-Scholes.
-
-    Returns a "tidy" DataFrame: one row per expiration, one column per
-    metric, each column a single consistent type (all float, e.g.). This
-    is what makes it safe to render via st.dataframe — Streamlit renders
-    through Apache Arrow under the hood, which requires each COLUMN to
-    have one inferable type. The previous version built this the other
-    way around (metrics as rows, then transposed so each expiration
-    became a column) — after transposing, every column ended up mixing
-    floats, ints, and "12.3%"-style strings, which Arrow couldn't
-    reliably type and crashed on. Percent columns here stay as plain
-    floats (e.g. 12.3, not "12.3%"); the "%" is added visually via
-    st.column_config when displaying, not baked into the data.
     """
     width = short_strike - long_strike
 
@@ -439,7 +509,7 @@ def convert_to_excel_bytes(metrics_df, current_price, ticker_symbol, long_strike
                   "Covered Call Strike", "Data Source", "Generated On"],
         "Value": [
             ticker_symbol, current_price, long_strike, short_strike, covered_call_strike,
-            "Alpaca (Basic market data, 15-min delayed)",
+            "Public.com (real-time brokerage market data)",
             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         ],
     })
@@ -455,7 +525,7 @@ def convert_to_excel_bytes(metrics_df, current_price, ticker_symbol, long_strike
 st.title("Bloom Energy Spread Calculator")
 
 ticker_symbol = TICKER_SYMBOL
-option_client, stock_client = get_clients()
+access_token, account_id = get_clients()
 
 # Risk-free rate: fetched silently in the background (FRED, live 1-month
 # Treasury yield), used only for local IV/delta fallback math. No UI
@@ -466,8 +536,8 @@ if risk_free_rate is None:
     risk_free_rate = 4.0
 
 try:
-    live_price = fetch_with_retry(lambda: fetch_current_price(stock_client, ticker_symbol))
-    st.metric("Live Price (Alpaca)", f"${live_price:.2f}")
+    live_price = fetch_with_retry(lambda: fetch_current_price(access_token, account_id, ticker_symbol))
+    st.metric("Live Price (Public)", f"${live_price:.2f}")
 
     current_share_price = st.number_input(
         "Current Share Price ($)", min_value=0.01, value=float(live_price), step=1.0
@@ -488,7 +558,7 @@ try:
 
     all_available_expirations = fetch_with_retry(
         lambda: fetch_spread_term_structure(
-            option_client, ticker_symbol=ticker_symbol, long_strike=long_strike,
+            access_token, account_id, ticker_symbol=ticker_symbol, long_strike=long_strike,
             short_strike=short_strike, covered_call_strike=covered_call_strike,
             current_price=current_share_price, risk_free_rate=risk_free_rate,
         )
@@ -555,10 +625,10 @@ try:
     st.markdown("### Full Term Structure")
     st.dataframe(formatted_display, use_container_width=True)
 
-    alpaca_count = (
-        (term_df["Delta (Hi) Source"] == "alpaca").sum()
-        + (term_df["Delta (Lo) Source"] == "alpaca").sum()
-        + (term_df["Delta (Covered Call) Source"] == "alpaca").sum()
+    public_count = (
+        (term_df["Delta (Hi) Source"] == "public").sum()
+        + (term_df["Delta (Lo) Source"] == "public").sum()
+        + (term_df["Delta (Covered Call) Source"] == "public").sum()
     )
     calculated_count = sum(
         (term_df[col] == "calculated").sum()
@@ -569,18 +639,18 @@ try:
         for col in ["Delta (Hi) Source", "Delta (Lo) Source", "Delta (Covered Call) Source"]
     )
     st.caption(
-        f"Delta values: {alpaca_count} from Alpaca's server-side greeks, "
+        f"Delta values: {public_count} from Public's server-side greeks, "
         f"{calculated_count} calculated locally via Black-Scholes using that "
         f"same contract's own implied volatility (solved from its own market "
-        f"price when Alpaca didn't report IV directly), {missing_count} "
-        f"unavailable (no Alpaca data and no market price to solve IV from)."
+        f"price when Public didn't report IV directly), {missing_count} "
+        f"unavailable (no Public data and no market price to solve IV from)."
     )
 
     # --- Unreliable-quote warning: surfaces exactly the rows where a
-    # leg's mid price came from a wide bid-ask spread or a stale last
-    # trade rather than a tight, trustworthy quote. This is the same
-    # failure mode that previously produced a 570%+ return on a
-    # far-dated, illiquid expiration — now flagged instead of silent. ---
+    # leg's mid price came from a wide bid-ask spread or a stale quote
+    # (per Public's own timestamps, checked only during regular market
+    # hours) rather than a tight, trustworthy one — and whether an
+    # interpolated-IV fallback was used instead of the raw quote. ---
     unreliable_rows = term_df[term_df["Unreliable Quote Warning"].notna()]
     if not unreliable_rows.empty:
         warning_lines = "\n".join(
@@ -589,9 +659,9 @@ try:
         )
         st.warning(
             "Some expirations have unreliable quotes (wide bid-ask spread or "
-            "stale last-trade fallback) on at least one leg — treat these "
-            "rows' Return %/Return per DTE with caution, and consider "
-            "re-checking them before using in a pitch:\n\n" + warning_lines
+            "stale quote) on at least one leg — treat these rows' Return "
+            "%/Return per DTE with caution, and consider re-checking them "
+            "before using in a pitch:\n\n" + warning_lines
         )
 
     # --- Strike-snap notices: tell the user if any leg didn't have an
@@ -605,17 +675,17 @@ try:
         actual_strikes = term_df[col].dropna().unique()
         mismatched = [s for s in actual_strikes if abs(s - requested) > 0.001]
         if mismatched:
-            mismatched_str = ", ".join(f"${s:.2f}" for s in sorted(mismatched))
+            mismatched_str = ", ".join(f"\\${s:.2f}" for s in sorted(mismatched))
             st.info(
-                f"Note: no contract listed at exactly ${requested:.2f} for the "
+                f"Note: no contract listed at exactly \\${requested:.2f} for the "
                 f"{label} leg on some expirations — used the nearest available "
                 f"strike instead ({mismatched_str})."
             )
 
     if covered_call_strike != short_strike:
         st.info(
-            f"Note: your covered call strike (${covered_call_strike:.0f}) is "
-            f"different from the spread's Hi strike (${short_strike:.0f}). The "
+            f"Note: your covered call strike (\\${covered_call_strike:.0f}) is "
+            f"different from the spread's Hi strike (\\${short_strike:.0f}). The "
             f"premium used to fund your spreads comes from the covered call, "
             f"and is calculated separately from the spread's own Hi-strike premium."
         )
@@ -633,4 +703,4 @@ try:
     )
 
 except Exception as e:
-    st.error(f"Error: {e}\n\nIf this is a rate-limit error from Alpaca, please wait a few minutes and refresh the page.")
+    st.error(f"Error: {e}\n\nIf this is a rate-limit error from Public, please wait a few minutes and refresh the page.")
