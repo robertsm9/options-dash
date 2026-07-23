@@ -179,6 +179,9 @@ def fetch_all_calls(_option_client, ticker_symbol, current_price, risk_free_rate
             "osi_symbol": osi_symbol,
             "expiration": expiration_date,
             "strike": strike,
+            "bid": bid,
+            "ask": ask,
+            "last": last_price,
             "mid": mid,
             "mid_reliable": mid_reliable,
             "mid_reason": mid_reason,
@@ -283,6 +286,22 @@ def fetch_spread_term_structure(
             "Covered Call Strike Used": covered_call_actual_strike,
             "Is Reliable": is_reliable,
             "Unreliable Quote Warning": "; ".join(unreliable_legs) if unreliable_legs else None,
+            # Raw quote fields, purely for the audit table below the
+            # main display — lets you verify exactly what fed the
+            # calculation for each leg (bid/ask/last/mid/delta), rather
+            # than only seeing the already-computed premium and delta.
+            "Lo Bid": long_row["bid"],
+            "Lo Ask": long_row["ask"],
+            "Lo Last": long_row["last"],
+            "Lo Mid": long_row["mid"],
+            "Hi Bid": short_row["bid"],
+            "Hi Ask": short_row["ask"],
+            "Hi Last": short_row["last"],
+            "Hi Mid": short_row["mid"],
+            "CC Bid": covered_call_row["bid"] if covered_call_row is not None else None,
+            "CC Ask": covered_call_row["ask"] if covered_call_row is not None else None,
+            "CC Last": covered_call_row["last"] if covered_call_row is not None else None,
+            "CC Mid": covered_call_row["mid"] if covered_call_row is not None else covered_call_premium,
         })
 
     if not rows:
@@ -600,6 +619,52 @@ try:
     st.markdown("---")
     st.markdown("### Full Term Structure")
     st.dataframe(formatted_display, use_container_width=True)
+
+    # --- Raw quote audit table: bid/ask/last/mid/delta for every leg
+    # (Lo, Hi, Covered Call) at every displayed expiration, so you can
+    # directly verify what fed each expiration's numbers above instead
+    # of only seeing the already-computed premium. ---
+    st.markdown("### Raw Quote Data (for verification)")
+    audit_rows = []
+    for _, row in term_df.iterrows():
+        for leg_label, bid_col, ask_col, last_col, mid_col, delta_col, strike_col in [
+            ("Lo (Call Bought)", "Lo Bid", "Lo Ask", "Lo Last", "Lo Mid", "Delta (Lo)", "Long Strike Used"),
+            ("Hi (Call Sold)", "Hi Bid", "Hi Ask", "Hi Last", "Hi Mid", "Delta (Hi)", "Short Strike Used"),
+            ("Covered Call", "CC Bid", "CC Ask", "CC Last", "CC Mid", "Delta (Covered Call)", "Covered Call Strike Used"),
+        ]:
+            audit_rows.append({
+                "Expiration": row["Expiration"],
+                "DTE": row["DTE"],
+                "Leg": leg_label,
+                "Strike": row[strike_col],
+                "Bid": row[bid_col],
+                "Ask": row[ask_col],
+                "Last": row[last_col],
+                "Mid (used)": row[mid_col],
+                "Delta": row[delta_col],
+            })
+    audit_df = pd.DataFrame(audit_rows)
+
+    def format_audit_cell(col, value):
+        if pd.isna(value):
+            return ""
+        if col == "DTE":
+            return str(int(value))
+        if col == "Delta":
+            return f"{value:.4f}"
+        if col in ("Bid", "Ask", "Last", "Mid (used)", "Strike"):
+            return f"{value:,.2f}"
+        return str(value)
+
+    audit_display = audit_df.copy()
+    for col in ["DTE", "Strike", "Bid", "Ask", "Last", "Mid (used)", "Delta"]:
+        audit_display[col] = audit_df[col].apply(lambda v, c=col: format_audit_cell(c, v))
+    st.dataframe(audit_display, use_container_width=True, hide_index=True)
+    st.caption(
+        "\"Mid (used)\" is what actually feeds the Full Term Structure table above — "
+        "either the live bid/ask midpoint, or a fallback (last trade) if no reliable "
+        "bid/ask was available, per the reliability check."
+    )
 
     alpaca_count = (
         (term_df["Delta (Hi) Source"] == "alpaca").sum()
