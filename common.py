@@ -58,12 +58,38 @@ def parse_osi_symbol(osi_symbol: str):
     return underlying, expiration_date, option_type, strike
 
 
-def get_mid_price(bid, ask, last):
+def get_mid_price(bid, ask, last, max_spread_pct=0.15):
+    """
+    Returns (mid_price, is_reliable, reason).
+
+    A quote is flagged unreliable when:
+      - the bid-ask spread is wider than `max_spread_pct` of the midpoint
+        (default 15%) — a common symptom of thin/stale quotes on
+        illiquid, far-dated contracts. Left unchecked, this can produce
+        two nearly-identical prices for strikes that should be
+        meaningfully different, which silently corrupts anything
+        downstream that divides by the gap between them (e.g. spread
+        value, # of spreads, return %).
+      - there's no usable bid/ask at all and the price falls back to the
+        last trade, which carries no guarantee of being recent.
+      - there's no usable price at all (returns 0.0, unreliable).
+
+    This doesn't fix bad data — Alpaca is still the source of a wide or
+    stale quote either way. It makes that unreliability visible to the
+    caller instead of silently blending it into the mid price as if it
+    were a tight, trustworthy quote.
+    """
     if bid is not None and ask is not None and bid > 0 and ask > 0:
-        return round((bid + ask) / 2, 2)
+        mid = (bid + ask) / 2
+        spread_pct = (ask - bid) / mid if mid > 0 else 1.0
+        if spread_pct <= max_spread_pct:
+            return round(mid, 2), True, None
+        return round(mid, 2), False, f"wide bid-ask spread ({spread_pct * 100:.0f}%)"
+
     if last is not None and last > 0:
-        return round(last, 2)
-    return 0.0
+        return round(last, 2), False, "no live bid/ask, fell back to last trade"
+
+    return 0.0, False, "no usable bid, ask, or last price"
 
 
 @st.cache_data(ttl=3600)

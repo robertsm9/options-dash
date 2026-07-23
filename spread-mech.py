@@ -119,6 +119,11 @@ def fetch_all_calls(_option_client, ticker_symbol, current_price, risk_free_rate
     Pull the full option chain (calls only). Per contract: Alpaca's own
     IV/delta first, solved locally from that contract's own market price
     only if Alpaca doesn't supply it. No borrowing from other strikes.
+
+    Each row now also carries `mid_reliable` (bool) and `mid_reason`
+    (str or None) from get_mid_price, so downstream code and the UI can
+    tell a tight, trustworthy quote apart from a wide-spread or stale
+    one instead of treating every positive price as equally trustworthy.
     """
     request = OptionChainRequest(underlying_symbol=ticker_symbol)
     chain = _option_client.get_option_chain(request)
@@ -137,7 +142,7 @@ def fetch_all_calls(_option_client, ticker_symbol, current_price, risk_free_rate
         last_price = snapshot.latest_trade.price if snapshot.latest_trade else None
         bid = snapshot.latest_quote.bid_price if snapshot.latest_quote else None
         ask = snapshot.latest_quote.ask_price if snapshot.latest_quote else None
-        mid = get_mid_price(bid, ask, last_price)
+        mid, mid_reliable, mid_reason = get_mid_price(bid, ask, last_price)
 
         raw_iv = getattr(snapshot, "implied_volatility", None)
         greeks = getattr(snapshot, "greeks", None)
@@ -170,6 +175,8 @@ def fetch_all_calls(_option_client, ticker_symbol, current_price, risk_free_rate
             "expiration": expiration_date,
             "strike": strike,
             "mid": mid,
+            "mid_reliable": mid_reliable,
+            "mid_reason": mid_reason,
             "implied_volatility": iv_pct,
             "iv_source": iv_source,
             "delta": delta_val,
@@ -220,11 +227,24 @@ def fetch_spread_term_structure(
         short_delta_source = short_row["delta_source"]
         long_delta_source = long_row["delta_source"]
 
+        # Collect any unreliable-quote reasons for this expiration's legs,
+        # so the UI can warn on exactly the rows most likely to produce
+        # the "collapsed spread value -> inflated return" failure mode.
+        unreliable_legs = []
+        if not bool(long_row["mid_reliable"]):
+            unreliable_legs.append(f"Lo ${long_actual_strike:.2f}: {long_row['mid_reason']}")
+        if not bool(short_row["mid_reliable"]):
+            unreliable_legs.append(f"Hi ${short_actual_strike:.2f}: {short_row['mid_reason']}")
+
         if covered_call_row is not None:
             covered_call_iv = covered_call_row["implied_volatility"]
             covered_call_premium = float(covered_call_row["mid"])
             covered_call_delta = covered_call_row["delta"]
             covered_call_delta_source = covered_call_row["delta_source"]
+            if not bool(covered_call_row["mid_reliable"]):
+                unreliable_legs.append(
+                    f"Covered call ${covered_call_actual_strike:.2f}: {covered_call_row['mid_reason']}"
+                )
         else:
             covered_call_iv = short_iv
             covered_call_premium = short_premium
@@ -251,6 +271,7 @@ def fetch_spread_term_structure(
             "Long Strike Used": long_actual_strike,
             "Short Strike Used": short_actual_strike,
             "Covered Call Strike Used": covered_call_actual_strike,
+            "Unreliable Quote Warning": "; ".join(unreliable_legs) if unreliable_legs else None,
         })
 
     if not rows:
@@ -554,6 +575,24 @@ try:
         f"price when Alpaca didn't report IV directly), {missing_count} "
         f"unavailable (no Alpaca data and no market price to solve IV from)."
     )
+
+    # --- Unreliable-quote warning: surfaces exactly the rows where a
+    # leg's mid price came from a wide bid-ask spread or a stale last
+    # trade rather than a tight, trustworthy quote. This is the same
+    # failure mode that previously produced a 570%+ return on a
+    # far-dated, illiquid expiration — now flagged instead of silent. ---
+    unreliable_rows = term_df[term_df["Unreliable Quote Warning"].notna()]
+    if not unreliable_rows.empty:
+        warning_lines = "\n".join(
+            f"- **{row['Expiration']} ({row['DTE']} DTE):** {row['Unreliable Quote Warning']}"
+            for _, row in unreliable_rows.iterrows()
+        )
+        st.warning(
+            "Some expirations have unreliable quotes (wide bid-ask spread or "
+            "stale last-trade fallback) on at least one leg — treat these "
+            "rows' Return %/Return per DTE with caution, and consider "
+            "re-checking them before using in a pitch:\n\n" + warning_lines
+        )
 
     # --- Strike-snap notices: tell the user if any leg didn't have an
     # exact listed match and had to snap to the nearest real strike ---
